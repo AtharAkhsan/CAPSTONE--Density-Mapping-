@@ -79,6 +79,9 @@ CAPSTONE (Density Mapping)/
 ├── 🐍 generate_ground_truth.py     # Script generate density map ground truth
 ├── 🐍 generate_density_map.py      # Utilitas & visualisasi density map
 ├── 🐍 model_dme.py                 # Arsitektur model deep learning
+├── 🐍 dataset_loader.py            # PyTorch Dataset & augmentasi (Albumentations)
+├── 🐍 train.py                     # Script utama proses training dengan MAE
+├── 🐍 predict.py                   # Script inference / prediksi pada gambar baru
 │
 └── 📂 dataset/
     ├── 📂 images/                   # Foto asli baut/part (.png, .jpg, .bmp)
@@ -106,7 +109,7 @@ CAPSTONE (Density Mapping)/
 
 ```bash
 # Install semua dependencies sekaligus
-pip install numpy opencv-python scipy matplotlib torch torchvision
+pip install numpy opencv-python scipy matplotlib torch torchvision albumentations
 ```
 
 | Library | Versi Min. | Kegunaan |
@@ -117,6 +120,7 @@ pip install numpy opencv-python scipy matplotlib torch torchvision
 | `matplotlib` | 3.4+ | Visualisasi heatmap overlay |
 | `torch` | 2.0+ | Deep learning framework |
 | `torchvision` | 0.15+ | Pretrained MobileNetV2 |
+| `albumentations` | 1.3+ | Pipeline augmentasi gambar dan density map secara sinkron |
 
 > **Catatan Windows:** Jika `python` tidak dikenali, gunakan `py` sebagai gantinya (Python Launcher for Windows).
 
@@ -358,9 +362,12 @@ Gaussian filter "menyebarkan" setiap titik menjadi distribusi kontinu. Parameter
 - ✅ Menangkap konteks multi-scale
 
 **Bilinear Upsample** digunakan karena:
-- ✅ Mengembalikan resolusi output ke ukuran input (224×224)
+- ✅ Mengembalikan resolusi output ke ukuran input
 - ✅ Tidak menambah parameter (parameter-free)
 - ✅ Menghasilkan transisi piksel yang halus
+
+**Preservasi Resolusi Asli:**
+Gambar diproses langsung pada **resolusi aslinya** (tidak di-_resize_ secara kaku ke rasio persegi seperti 224x224). Ini adalah keputusan arsitektur yang krusial untuk mencegah hancurnya detail spasial objek berukuran mikro akibat proses downscaling, memastikan model tetap bisa membedakan titik antar-objek dengan jelas pada density map.
 
 ### Format Anotasi (JSON)
 
@@ -404,6 +411,12 @@ py model_dme.py
 
 # 7. (Opsional) Demo density map dengan dummy data
 py generate_density_map.py
+
+# 8. Training Model (Pastikan sudah generate ground truth terlebih dahulu!)
+py train.py
+
+# 9. Prediksi / Inference menggunakan Model terlatih (akan memuat checkpoints/best_dme_model.pth)
+py predict.py
 ```
 
 ---
@@ -429,12 +442,13 @@ py generate_density_map.py
 - [x] **Ground Truth Generator** — Konversi anotasi → density map (.npy + visualisasi)
 - [x] **Model Architecture** — MobileNetV2 + Dilated Conv + Upsample
 - [x] **Utilitas Density Map** — Fungsi reusable & visualisasi
-- [ ] **Dataset Loader** — PyTorch `Dataset` dan `DataLoader` untuk training
-- [ ] **Training Script** — Script training dengan loss function (MSE) dan optimizer
-- [ ] **Evaluation Metrics** — MAE, MSE, dan MAPE untuk evaluasi model
-- [ ] **Inference Script** — Prediksi jumlah objek dari gambar baru
+- [x] **Dataset Loader** — PyTorch `Dataset` dan `DataLoader` dengan augmentasi _Albumentations_ sinkron
+- [x] **Training Script** — Loop eksekusi training dengan MSE, Adam, dan _auto-checkpoint_
+- [x] **Evaluation Metrics** — Laporan MAE (_Mean Absolute Error_) per-*epoch*
+- [x] **Inference Script** — Modul prediksi `predict.py` untuk mengestimasi jumlah objek dengan visualisasi gabungan
 - [ ] **Model Export** — Export model ke ONNX untuk deployment
 - [ ] **Web Interface** — Dashboard visualisasi hasil prediksi
+
 
 ---
 
