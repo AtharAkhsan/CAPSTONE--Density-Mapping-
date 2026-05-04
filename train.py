@@ -15,7 +15,7 @@ from dataset_loader import DMEDataset, get_train_transforms
 # ============================================================
 EPOCHS = 50
 BATCH_SIZE = 2          # Kecil karena komputasi heatmap cukup berat
-LEARNING_RATE = 1e-4
+LEARNING_RATE = 5e-5    # Diperkecil untuk Fine-Tuning (sebelumnya 1e-4)
 CHECKPOINT_DIR = 'checkpoints'
 BEST_MODEL_PATH = os.path.join(CHECKPOINT_DIR, 'best_dme_model.pth')
 
@@ -85,6 +85,19 @@ def train():
     model = DensityMapRegressor(pretrained=True)
     model = model.to(device)
 
+    # ==== FITUR RESUME TRAINING (FINE-TUNING) ====
+    best_mae = float('inf')
+    if os.path.exists(BEST_MODEL_PATH):
+        print(f"  [Resume] Loading checkpoint dari: {BEST_MODEL_PATH}")
+        checkpoint = torch.load(BEST_MODEL_PATH, map_location=device, weights_only=True)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        
+        # Ambil best_mae sebelumnya agar checkpoint tidak tertimpa oleh model yang lebih buruk
+        best_mae = checkpoint.get('best_mae', float('inf'))
+        print(f"  [Resume] Berhasil load! Previous Best MAE: {best_mae:.4f}")
+    else:
+        print(f"  [Resume] Checkpoint tidak ditemukan, training dari awal.")
+
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  Architecture   : MobileNetV2 + Dilated Conv + Upsample")
@@ -104,7 +117,7 @@ def train():
     print(f"  Checkpoint dir : {os.path.abspath(CHECKPOINT_DIR)}")
 
     # ---- 6. Training Loop ----
-    best_mae = float('inf')
+    # best_mae sudah diinisialisasi saat proses load checkpoint di atas
 
     print("\n" + "-" * 65)
     print(f"  {'Epoch':>5}  |  {'Loss':>12}  |  {'MAE':>10}  |  {'Best MAE':>10}  |  Time")
@@ -130,7 +143,7 @@ def train():
             outputs = model(images)                     # (B, 1, H, W)
 
             # ---- Hitung loss (MSE antara predicted & ground truth heatmap) ----
-            loss = criterion(outputs, heatmaps)
+            loss = criterion(outputs, heatmaps * 1000.0)
 
             # ---- Backward pass & optimizer step ----
             optimizer.zero_grad()
@@ -143,7 +156,7 @@ def train():
             with torch.no_grad():
                 batch_size_actual = images.size(0)
                 for i in range(batch_size_actual):
-                    pred_count = outputs[i].sum().item()
+                    pred_count = outputs[i].sum().item() / 1000.0
                     gt_count = heatmaps[i].sum().item()
                     epoch_mae += abs(pred_count - gt_count)
 
