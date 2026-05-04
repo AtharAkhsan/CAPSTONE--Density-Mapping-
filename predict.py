@@ -134,8 +134,8 @@ def predict(model, image_tensor, device):
     with torch.no_grad():
         output = model(image_tensor)  # (1, 1, H, W)
 
-    # Konversi output ke numpy
-    density_map = output.squeeze().cpu().numpy()  # (H, W)
+    # Konversi output ke numpy (dibagi 1000.0 sesuai scaling factor saat training)
+    density_map = (output / 1000.0).squeeze().cpu().numpy()  # (H, W)
 
     # Hitung jumlah objek = sum seluruh piksel density map
     predicted_count = density_map.sum()
@@ -267,20 +267,32 @@ def run_prediction(image_path, checkpoint_path=CHECKPOINT_PATH):
 # Eksekusi Utama
 # ============================================================
 if __name__ == '__main__':
-    # Default: gunakan gambar pertama di dataset/images/
-    TEST_IMAGE_DIR = os.path.join('dataset', 'images')
+    import sys
 
-    # Cari gambar pertama yang tersedia
-    supported_ext = ('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff')
-    image_files = sorted([
-        f for f in os.listdir(TEST_IMAGE_DIR)
-        if f.lower().endswith(supported_ext)
-    ])
-
-    if not image_files:
-        print(f"Tidak ada gambar di folder '{TEST_IMAGE_DIR}'")
-    else:
-        TEST_IMAGE_PATH = os.path.join(TEST_IMAGE_DIR, image_files[0])
-        print(f"Menggunakan gambar test: {TEST_IMAGE_PATH}")
+    # Cek apakah ada argumen path gambar dari command line
+    if len(sys.argv) > 1:
+        TEST_IMAGE_PATH = sys.argv[1]
+        if not os.path.exists(TEST_IMAGE_PATH):
+            print(f"[ERROR] File gambar tidak ditemukan: {TEST_IMAGE_PATH}")
+            sys.exit(1)
+        print(f"Menggunakan gambar dari argumen: {TEST_IMAGE_PATH}")
         run_prediction(TEST_IMAGE_PATH)
+    else:
+        # Default: gunakan gambar pertama di dataset/images/ jika tidak ada argumen
+        TEST_IMAGE_DIR = os.path.join('dataset', 'images')
+        
+        supported_ext = ('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff')
+        image_files = sorted([
+            f for f in os.listdir(TEST_IMAGE_DIR)
+            if f.lower().endswith(supported_ext)
+        ])
+
+        if not image_files:
+            print(f"Tidak ada gambar di folder '{TEST_IMAGE_DIR}'")
+        else:
+            TEST_IMAGE_PATH = os.path.join(TEST_IMAGE_DIR, image_files[0])
+            print(f"Tidak ada argumen path gambar yang diberikan.")
+            print(f"Menggunakan gambar test default: {TEST_IMAGE_PATH}")
+            print(f"Tips: Anda bisa menjalankan dengan: py predict.py path/ke/gambar.jpg\n")
+            run_prediction(TEST_IMAGE_PATH)
  

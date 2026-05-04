@@ -11,7 +11,7 @@ from scipy.ndimage import gaussian_filter
 IMAGES_DIR = os.path.join('dataset', 'images')
 ANNOTATIONS_DIR = os.path.join('dataset', 'annotations')
 GROUND_TRUTH_DIR = os.path.join('dataset', 'ground_truth')
-SIGMA = 15  # Ukuran sebaran Gaussian heatmap
+SIGMA = 8  # Ukuran sebaran Gaussian heatmap
 
 
 def generate_density_map(image_shape, points, sigma=SIGMA):
