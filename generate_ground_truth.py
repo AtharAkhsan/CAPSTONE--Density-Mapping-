@@ -1,9 +1,9 @@
 import os
 import json
+import math
 import numpy as np
 import cv2
 from scipy.ndimage import gaussian_filter
-from scipy.spatial import KDTree
 
 
 # ==============================
@@ -12,24 +12,40 @@ from scipy.spatial import KDTree
 IMAGES_DIR = os.path.join('dataset', 'images')
 ANNOTATIONS_DIR = os.path.join('dataset', 'annotations')
 GROUND_TRUTH_DIR = os.path.join('dataset', 'ground_truth')
-SIGMA = 15  # Ukuran default sebaran Gaussian heatmap (untuk objek <= 3)
+BASE_SIGMA = 8  # Sigma dasar pada resolusi referensi
+
+# Resolusi referensi (resolusi training asli)
+REFERENCE_RESOLUTION = (672, 512)  # (width, height)
 
 
-def generate_density_map(image_shape, points, default_sigma=SIGMA, beta=0.3, min_sigma=4.0, max_sigma=15.0):
+def generate_density_map(image_shape, points, base_sigma=BASE_SIGMA,
+                         reference_resolution=REFERENCE_RESOLUTION):
     """
-    Generate density map dari list koordinat titik menggunakan Geometry-Adaptive Gaussian Kernel.
+    Generate density map dari list koordinat titik dengan sigma adaptif.
+
+    Sigma dihitung berdasarkan rasio area gambar terhadap resolusi referensi:
+        sigma = base_sigma * sqrt((w * h) / (ref_w * ref_h))
+
+    Pada resolusi referensi (672x512), sigma = base_sigma (8).
+    Pada resolusi lebih tinggi, sigma meningkat proporsional -> blob lebih besar.
+    Pada resolusi lebih rendah, sigma menurun proporsional -> blob lebih kecil.
 
     Parameters:
         image_shape (tuple): (height, width) dari gambar.
         points (list): List koordinat [[x1, y1], [x2, y2], ...].
-        default_sigma (float): Sigma statis untuk jumlah objek <= 3.
-        beta (float): Faktor pengali rata-rata jarak ke k-tetangga terdekat.
-        min_sigma (float): Batas bawah nilai sigma.
-        max_sigma (float): Batas atas nilai sigma.
+        base_sigma (float): Sigma dasar pada resolusi referensi.
+        reference_resolution (tuple): (ref_w, ref_h) resolusi referensi.
 
     Returns:
-        numpy.ndarray: Density map (float32).
+        numpy.ndarray: Density map (float32) dengan sum ~ jumlah titik.
     """
+    h, w = image_shape
+    ref_w, ref_h = reference_resolution
+
+    # Adaptive sigma: skala berdasarkan rasio area
+    area_ratio = (w * h) / (ref_w * ref_h)
+    sigma = base_sigma * math.sqrt(area_ratio)
+
     density = np.zeros(image_shape, dtype=np.float32)
     num_points = len(points)
 
@@ -145,11 +161,12 @@ def main():
     print("\n" + "=" * 60)
     print("  GENERATE GROUND TRUTH - Density Map dari Anotasi")
     print("=" * 60)
-    print(f"  Annotations : {ANNOTATIONS_DIR}")
-    print(f"  Images      : {IMAGES_DIR}")
-    print(f"  Output      : {GROUND_TRUTH_DIR}")
-    print(f"  Sigma       : {SIGMA}")
-    print(f"  Total file  : {len(json_files)}")
+    print(f"  Annotations          : {ANNOTATIONS_DIR}")
+    print(f"  Images               : {IMAGES_DIR}")
+    print(f"  Output               : {GROUND_TRUTH_DIR}")
+    print(f"  Base sigma           : {BASE_SIGMA}")
+    print(f"  Reference resolution : {REFERENCE_RESOLUTION[0]}x{REFERENCE_RESOLUTION[1]}")
+    print(f"  Total file           : {len(json_files)}")
     print("=" * 60)
 
     success_count = 0
@@ -189,9 +206,18 @@ def main():
         h, w = image.shape[:2]
         print(f"  Dimensi : {w} x {h}")
 
-        # ---- 3. Generate density map ----
-        density_map = generate_density_map((h, w), points, default_sigma=SIGMA)
+        # ---- 3. Generate density map (adaptive sigma) ----
+        density_map = generate_density_map(
+            (h, w), points,
+            base_sigma=BASE_SIGMA,
+            reference_resolution=REFERENCE_RESOLUTION,
+        )
 
+        # Hitung sigma yang digunakan untuk logging
+        area_ratio = (w * h) / (REFERENCE_RESOLUTION[0] * REFERENCE_RESOLUTION[1])
+        effective_sigma = BASE_SIGMA * math.sqrt(area_ratio)
+
+        print(f"  Effective sigma   : {effective_sigma:.2f}")
         print(f"  Density map shape : {density_map.shape}")
         print(f"  Density map max   : {density_map.max():.8f}")
         print(f"  Density map sum   : {density_map.sum():.4f} "

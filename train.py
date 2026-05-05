@@ -57,7 +57,7 @@ def train():
     train_transform = get_train_transforms()
     train_dataset = DMEDataset(
         images_dir=os.path.join('dataset', 'images'),
-        ground_truth_dir=os.path.join('dataset', 'ground_truth'),
+        annotations_dir=os.path.join('dataset', 'annotations'),
         transform=train_transform,
     )
 
@@ -65,7 +65,7 @@ def train():
         print("\n  [ERROR] Tidak ada data training!")
         print("  Pastikan sudah menjalankan:")
         print("    1. py point_labeler.py          (anotasi titik)")
-        print("    2. py generate_ground_truth.py   (generate .npy)")
+        print("    2. Pastikan file JSON anotasi ada di dataset/annotations/")
         return
 
     train_loader = DataLoader(
