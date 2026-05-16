@@ -13,7 +13,7 @@ from model_dme import DensityMapRegressor
 # ============================================================
 # Konfigurasi
 # ============================================================
-CHECKPOINT_PATH = os.path.join('checkpoints', 'best_dme_model.pth')
+CHECKPOINT_PATH = os.path.join('checkpoints', 'final_dme_97percent.pth')
 
 # Resolusi target – harus sama dengan yang digunakan saat training (dataset_loader.py)
 TARGET_SIZE = (672, 512)  # (width, height)

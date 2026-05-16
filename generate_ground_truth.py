@@ -4,7 +4,7 @@ import math
 import numpy as np
 import cv2
 from scipy.ndimage import gaussian_filter
-
+from scipy.spatial import KDTree
 
 # ==============================
 # Konfigurasi

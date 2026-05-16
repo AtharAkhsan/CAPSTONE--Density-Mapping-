@@ -158,7 +158,7 @@ class DMEDataset(Dataset):
     """
 
     def __init__(self, images_dir=IMAGES_DIR, annotations_dir=ANNOTATIONS_DIR,
-                 transform=None, scale_range=(0.5, 1.5),
+                 transform=None, scale_range=(1.0, 1.0), # 0.5, 1.5
                  target_size=(REFERENCE_W, REFERENCE_H),
                  base_sigma=8,
                  reference_resolution=(REFERENCE_W, REFERENCE_H)):

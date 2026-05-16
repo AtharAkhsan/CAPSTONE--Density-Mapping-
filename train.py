@@ -13,12 +13,18 @@ from dataset_loader import DMEDataset, get_train_transforms
 # ============================================================
 # Hyperparameters
 # ============================================================
-EPOCHS = 50
+EPOCHS = 30
 BATCH_SIZE = 2          # Kecil karena komputasi heatmap cukup berat
 LEARNING_RATE = 5e-5    # Diperkecil untuk Fine-Tuning (sebelumnya 1e-4)
 CHECKPOINT_DIR = 'checkpoints'
-BEST_MODEL_PATH = os.path.join(CHECKPOINT_DIR, 'best_dme_model.pth')
+# --- Comment dulu path aslinya biar otak AI lu yang lama nggak ketimpa ---
+# BEST_MODEL_PATH = os.path.join(CHECKPOINT_DIR, 'best_dme_model.pth')
 
+# Path buat load model MAE 4.97
+RESUME_PATH = os.path.join(CHECKPOINT_DIR, 'testing_100_epoch.pth')
+
+# Path buat nge-save hasil S3 Lanjutan lu (biar file lama aman)
+BEST_MODEL_PATH = os.path.join(CHECKPOINT_DIR, 'final_dme_97percent.pth')
 
 def select_device():
     """
@@ -87,9 +93,9 @@ def train():
 
     # ==== FITUR RESUME TRAINING (FINE-TUNING) ====
     best_mae = float('inf')
-    if os.path.exists(BEST_MODEL_PATH):
-        print(f"  [Resume] Loading checkpoint dari: {BEST_MODEL_PATH}")
-        checkpoint = torch.load(BEST_MODEL_PATH, map_location=device, weights_only=True)
+    if os.path.exists(RESUME_PATH):
+        print(f"  [Resume] Loading checkpoint dari: {RESUME_PATH}")
+        checkpoint = torch.load(RESUME_PATH, map_location=device, weights_only=True)
         model.load_state_dict(checkpoint['model_state_dict'])
         
         # Ambil best_mae sebelumnya agar checkpoint tidak tertimpa oleh model yang lebih buruk
