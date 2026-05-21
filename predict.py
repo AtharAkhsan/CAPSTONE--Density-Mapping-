@@ -6,14 +6,15 @@ import matplotlib.pyplot as plt
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
-# Import arsitektur model dari file proyek
+# Import dari file proyek
 from model_dme import DensityMapRegressor
+from density_utils import create_visualization
 
 
 # ============================================================
 # Konfigurasi
 # ============================================================
-CHECKPOINT_PATH = os.path.join('checkpoints', 'final_dme_97percent.pth')
+CHECKPOINT_PATH = os.path.join('checkpoints', 'best_dme_model.pth')
 
 # Resolusi target – harus sama dengan yang digunakan saat training (dataset_loader.py)
 TARGET_SIZE = (672, 512)  # (width, height)
@@ -21,6 +22,9 @@ TARGET_SIZE = (672, 512)  # (width, height)
 # Normalisasi standar ImageNet
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
+
+# Debug mode: aktifkan assertion untuk memverifikasi count preservation saat resize
+DEBUG = True
 
 
 def select_device():
@@ -65,10 +69,10 @@ def load_model(checkpoint_path, device):
     model.eval()
 
     epoch = checkpoint.get('epoch', '?')
-    best_mae = checkpoint.get('best_mae', '?')
+    best_val_mae = checkpoint.get('best_val_mae', checkpoint.get('best_mae', '?'))
     print(f"  Checkpoint : {checkpoint_path}")
     print(f"  Epoch      : {epoch}")
-    print(f"  Best MAE   : {best_mae}")
+    print(f"  Best MAE   : {best_val_mae}")
 
     return model
 
@@ -118,12 +122,12 @@ def predict(model, image_tensor, device):
 def resize_density_map_to_original(density_map, original_size, target_size=TARGET_SIZE):
     """
     Kembalikan density map ke ukuran asli gambar dengan koreksi area.
-    
+
     Parameters:
         density_map (np.ndarray): Density map pada ukuran target.
         original_size (tuple): (orig_w, orig_h) ukuran gambar asli.
         target_size (tuple): (target_w, target_h) ukuran saat inference.
-    
+
     Returns:
         np.ndarray: Density map ukuran asli dengan sum ~ jumlah objek.
     """
@@ -133,38 +137,26 @@ def resize_density_map_to_original(density_map, original_size, target_size=TARGE
     if (orig_w == target_w) and (orig_h == target_h):
         return density_map
 
-    # Simpan sum sebelum resize untuk koreksi area
+    # Simpan sum sebelum resize untuk koreksi dan verifikasi
     sum_before = density_map.sum()
 
     # Resize menggunakan bilinear interpolation
     density_orig = cv2.resize(density_map, (orig_w, orig_h),
                               interpolation=cv2.INTER_LINEAR)
 
-    # Koreksi area: perkalian dengan (area_target / area_original)
-    # Karena setelah resize ke ukuran lebih besar, nilai pixel mengecil.
-    area_ratio = (target_w * target_h) / (orig_w * orig_h)
-    if sum_before > 0:
-        density_orig *= area_ratio
+    # Koreksi area: setelah resize, sum berubah karena area pixel berubah.
+    # Kita normalkan kembali agar sum tetap sama dengan sebelum resize.
+    sum_after_resize = density_orig.sum()
+    if sum_after_resize > 0:
+        density_orig *= (sum_before / sum_after_resize)
+
+    # Debug assertion: pastikan count tidak berubah signifikan saat resize
+    if DEBUG:
+        assert abs(density_orig.sum() - sum_before) < 0.5, \
+            (f"Count changed during resize: "
+             f"{sum_before:.1f} -> {density_orig.sum():.1f}")
 
     return density_orig
-
-
-def create_heatmap_overlay(original_image, density_map_orig):
-    """
-    Buat overlay heatmap JET di atas gambar asli (ukuran asli).
-    """
-    # Normalisasi density map ke 0-255
-    if density_map_orig.max() > 0:
-        density_norm = (density_map_orig / density_map_orig.max() * 255).astype(np.uint8)
-    else:
-        density_norm = np.zeros_like(density_map_orig, dtype=np.uint8)
-
-    heatmap_bgr = cv2.applyColorMap(density_norm, cv2.COLORMAP_JET)
-    heatmap_rgb = cv2.cvtColor(heatmap_bgr, cv2.COLOR_BGR2RGB)
-
-    # Ukuran sudah sama, langsung overlay
-    overlay = cv2.addWeighted(original_image, 0.5, heatmap_rgb, 0.5, 0)
-    return overlay
 
 
 def visualize_result(original_image, overlay, predicted_count, image_name):
@@ -245,8 +237,11 @@ def run_prediction(image_path, checkpoint_path=CHECKPOINT_PATH, target_size=TARG
     print(f"  │  PREDICTED COUNT : {final_count:>8.1f} objek   │")
     print(f"  └─────────────────────────────────────┘")
 
-    # ---- 6. Visualisasi ----
-    overlay = create_heatmap_overlay(original_image, density_map_orig)
+    # ---- 6. Visualisasi (menggunakan density_utils.create_visualization) ----
+    overlay = create_visualization(
+        original_image, density_map_orig,
+        input_is_rgb=True,
+    )
     visualize_result(original_image, overlay, final_count, image_name)
 
     print(f"\n  Prediksi selesai!")
@@ -270,7 +265,7 @@ if __name__ == '__main__':
         run_prediction(TEST_IMAGE_PATH)
     else:
         TEST_IMAGE_DIR = os.path.join('dataset', 'images')
-        
+
         supported_ext = ('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff')
         image_files = sorted([
             f for f in os.listdir(TEST_IMAGE_DIR)

@@ -7,7 +7,10 @@ from torch.utils.data import DataLoader
 
 # Import dari file proyek
 from model_dme import DensityMapRegressor
-from dataset_loader import DMEDataset, get_train_transforms
+from dataset_loader import (
+    DMEDataset, load_all_samples, stratified_split,
+    get_train_transforms, get_val_transforms,
+)
 
 
 # ============================================================
@@ -15,16 +18,10 @@ from dataset_loader import DMEDataset, get_train_transforms
 # ============================================================
 EPOCHS = 30
 BATCH_SIZE = 2          # Kecil karena komputasi heatmap cukup berat
-LEARNING_RATE = 5e-5    # Diperkecil untuk Fine-Tuning (sebelumnya 1e-4)
+LEARNING_RATE = 5e-5    # Learning rate untuk fine-tuning
 CHECKPOINT_DIR = 'checkpoints'
-# --- Comment dulu path aslinya biar otak AI lu yang lama nggak ketimpa ---
-# BEST_MODEL_PATH = os.path.join(CHECKPOINT_DIR, 'best_dme_model.pth')
+BEST_MODEL_PATH = os.path.join(CHECKPOINT_DIR, 'best_dme_model.pth')
 
-# Path buat load model MAE 4.97
-RESUME_PATH = os.path.join(CHECKPOINT_DIR, 'testing_100_epoch.pth')
-
-# Path buat nge-save hasil S3 Lanjutan lu (biar file lama aman)
-BEST_MODEL_PATH = os.path.join(CHECKPOINT_DIR, 'final_dme_97percent.pth')
 
 def select_device():
     """
@@ -47,6 +44,8 @@ def select_device():
 def train():
     """
     Fungsi utama untuk training model DME.
+    Training dari scratch (ImageNet pretrained weights) dengan stratified
+    train/val split dan scale augmentation.
     """
     print("\n" + "=" * 65)
     print("  TRAINING — Density Map Estimation (DME)")
@@ -60,19 +59,32 @@ def train():
 
     # ---- 3. Dataset & DataLoader ----
     print(f"\n  [Dataset]")
-    train_transform = get_train_transforms()
-    train_dataset = DMEDataset(
-        images_dir=os.path.join('dataset', 'images'),
-        annotations_dir=os.path.join('dataset', 'annotations'),
-        transform=train_transform,
-    )
 
-    if len(train_dataset) == 0:
+    # Load semua samples dan split secara stratified
+    all_samples = load_all_samples()
+    if len(all_samples) == 0:
         print("\n  [ERROR] Tidak ada data training!")
         print("  Pastikan sudah menjalankan:")
         print("    1. py point_labeler.py          (anotasi titik)")
         print("    2. Pastikan file JSON anotasi ada di dataset/annotations/")
         return
+
+    train_samples, val_samples = stratified_split(all_samples, val_ratio=0.2)
+
+    # Buat dataset objects
+    train_transform = get_train_transforms()
+    val_transform = get_val_transforms()
+
+    train_dataset = DMEDataset(
+        samples=train_samples,
+        transform=train_transform,
+        scale_range=(0.75, 1.25),
+    )
+    val_dataset = DMEDataset(
+        samples=val_samples,
+        transform=val_transform,
+        scale_range=(1.0, 1.0),  # Tidak ada scale augmentation saat validasi
+    )
 
     train_loader = DataLoader(
         train_dataset,
@@ -81,34 +93,31 @@ def train():
         num_workers=0,      # 0 untuk Windows compatibility
         pin_memory=True if device.type == 'cuda' else False,
     )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=True if device.type == 'cuda' else False,
+    )
 
-    print(f"  Total samples  : {len(train_dataset)}")
+    print(f"  Train samples  : {len(train_dataset)}")
+    print(f"  Val samples    : {len(val_dataset)}")
     print(f"  Batch size     : {BATCH_SIZE}")
-    print(f"  Total batches  : {len(train_loader)}")
+    print(f"  Train batches  : {len(train_loader)}")
+    print(f"  Val batches    : {len(val_loader)}")
 
-    # ---- 4. Model ----
+    # ---- 4. Model (from scratch with ImageNet pretrained backbone) ----
     print(f"\n  [Model]")
     model = DensityMapRegressor(pretrained=True)
     model = model.to(device)
-
-    # ==== FITUR RESUME TRAINING (FINE-TUNING) ====
-    best_mae = float('inf')
-    if os.path.exists(RESUME_PATH):
-        print(f"  [Resume] Loading checkpoint dari: {RESUME_PATH}")
-        checkpoint = torch.load(RESUME_PATH, map_location=device, weights_only=True)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        
-        # Ambil best_mae sebelumnya agar checkpoint tidak tertimpa oleh model yang lebih buruk
-        best_mae = checkpoint.get('best_mae', float('inf'))
-        print(f"  [Resume] Berhasil load! Previous Best MAE: {best_mae:.4f}")
-    else:
-        print(f"  [Resume] Checkpoint tidak ditemukan, training dari awal.")
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  Architecture   : MobileNetV2 + Dilated Conv + Upsample")
     print(f"  Total params   : {total_params:,}")
     print(f"  Trainable      : {trainable_params:,}")
+    print(f"  Training from  : scratch (ImageNet pretrained backbone)")
 
     # ---- 5. Loss Function & Optimizer ----
     # MSELoss karena ini adalah regresi heatmap (bukan klasifikasi)
@@ -123,19 +132,21 @@ def train():
     print(f"  Checkpoint dir : {os.path.abspath(CHECKPOINT_DIR)}")
 
     # ---- 6. Training Loop ----
-    # best_mae sudah diinisialisasi saat proses load checkpoint di atas
+    best_val_mae = float('inf')
 
-    print("\n" + "-" * 65)
-    print(f"  {'Epoch':>5}  |  {'Loss':>12}  |  {'MAE':>10}  |  {'Best MAE':>10}  |  Time")
-    print("-" * 65)
+    print("\n" + "-" * 80)
+    print(f"  {'Epoch':>5}  |  {'Train Loss':>12}  |  {'Train MAE':>10}  |  "
+          f"{'Val MAE':>10}  |  {'Best Val MAE':>12}  |  Time")
+    print("-" * 80)
 
     for epoch in range(1, EPOCHS + 1):
+        epoch_start = time.time()
+
+        # ======== TRAINING PHASE ========
         model.train()
         epoch_loss = 0.0
         epoch_mae = 0.0
-        num_samples = 0
-
-        epoch_start = time.time()
+        num_train_samples = 0
 
         for batch_idx, batch in enumerate(train_loader):
             # Ambil data dari batch
@@ -157,8 +168,6 @@ def train():
             optimizer.step()
 
             # ---- Hitung MAE (selisih jumlah objek) ----
-            # sum(predicted_heatmap) ≈ jumlah objek prediksi
-            # sum(ground_truth_heatmap) ≈ jumlah objek sebenarnya
             with torch.no_grad():
                 batch_size_actual = images.size(0)
                 for i in range(batch_size_actual):
@@ -167,37 +176,57 @@ def train():
                     epoch_mae += abs(pred_count - gt_count)
 
             epoch_loss += loss.item() * images.size(0)
-            num_samples += images.size(0)
+            num_train_samples += images.size(0)
 
-        # ---- Rata-rata metrik per epoch ----
-        avg_loss = epoch_loss / num_samples
-        avg_mae = epoch_mae / num_samples
+        avg_train_loss = epoch_loss / num_train_samples
+        avg_train_mae = epoch_mae / num_train_samples
+
+        # ======== VALIDATION PHASE ========
+        model.eval()
+        val_mae = 0.0
+
+        with torch.no_grad():
+            for batch in val_loader:
+                images = batch['image'].to(device)
+                heatmaps = batch['heatmap'].to(device)
+                heatmaps = heatmaps.unsqueeze(1)
+
+                outputs = model(images)
+
+                for i in range(images.size(0)):
+                    pred_count = outputs[i].sum().item() / 1000.0
+                    gt_count = heatmaps[i].sum().item()  # NOT scaled by 1000
+                    val_mae += abs(pred_count - gt_count)
+
+        avg_val_mae = val_mae / len(val_dataset)
+
         epoch_time = time.time() - epoch_start
 
-        # ---- Model Checkpointing ----
-        # Simpan model jika MAE saat ini lebih baik (lebih kecil)
-        is_best = avg_mae < best_mae
+        # ---- Model Checkpointing (based on val MAE) ----
+        is_best = avg_val_mae < best_val_mae
         if is_best:
-            best_mae = avg_mae
+            best_val_mae = avg_val_mae
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'best_mae': best_mae,
-                'loss': avg_loss,
+                'best_val_mae': best_val_mae,
+                'train_mae': avg_train_mae,
+                'loss': avg_train_loss,
             }, BEST_MODEL_PATH)
             marker = " ★ SAVED"
         else:
             marker = ""
 
         # ---- Logging ----
-        print(f"  {epoch:>5}  |  {avg_loss:>12.8f}  |  {avg_mae:>10.4f}  |"
-              f"  {best_mae:>10.4f}  |  {epoch_time:.1f}s{marker}")
+        print(f"  {epoch:>5}  |  {avg_train_loss:>12.8f}  |  {avg_train_mae:>10.4f}  |  "
+              f"{avg_val_mae:>10.4f}  |  {best_val_mae:>12.4f}  |  "
+              f"{epoch_time:.1f}s{marker}")
 
     # ---- Training Selesai ----
-    print("-" * 65)
+    print("-" * 80)
     print(f"\n  Training selesai!")
-    print(f"  Best MAE       : {best_mae:.4f}")
+    print(f"  Best Val MAE   : {best_val_mae:.4f}")
     print(f"  Best model     : {os.path.abspath(BEST_MODEL_PATH)}")
     print("=" * 65 + "\n")
 
