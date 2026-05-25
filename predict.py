@@ -16,7 +16,7 @@ from density_utils import create_visualization
 # ============================================================
 CHECKPOINT_PATH = os.path.join('checkpoints', 'best_dme_model.pth')
 
-# Resolusi target – harus sama dengan yang digunakan saat training (dataset_loader.py)
+# Resolusi target - harus sama dengan yang digunakan saat training (dataset_loader.py)
 TARGET_SIZE = (672, 512)  # (width, height)
 
 # Normalisasi standar ImageNet
@@ -188,7 +188,7 @@ def visualize_result(original_image, overlay, predicted_count, image_name):
 
 def run_prediction(image_path, checkpoint_path=CHECKPOINT_PATH, target_size=TARGET_SIZE):
     """
-    Pipeline lengkap prediksi yang sekarang scale‑invariant.
+    Pipeline lengkap prediksi yang sekarang scale-invariant.
     1. Load model
     2. Preprocess: resize gambar ke target size, simpan original
     3. Inference pada ukuran target
@@ -198,7 +198,7 @@ def run_prediction(image_path, checkpoint_path=CHECKPOINT_PATH, target_size=TARG
     image_name = os.path.basename(image_path)
 
     print("\n" + "=" * 60)
-    print("  PREDICT — Density Map Estimation (DME)  [Scale‑Invariant]")
+    print("  PREDICT - Density Map Estimation (DME)  [Scale-Invariant]")
     print("=" * 60)
 
     # ---- 1. Device ----
@@ -233,9 +233,9 @@ def run_prediction(image_path, checkpoint_path=CHECKPOINT_PATH, target_size=TARG
     final_count = density_map_orig.sum()
     print(f"  Density map (original) sum : {final_count:.4f}")
 
-    print(f"\n  ┌─────────────────────────────────────┐")
-    print(f"  │  PREDICTED COUNT : {final_count:>8.1f} objek   │")
-    print(f"  └─────────────────────────────────────┘")
+    print(f"\n  +-------------------------------------+")
+    print(f"  |  PREDICTED COUNT : {final_count:>8.1f} objek   |")
+    print(f"  +-------------------------------------+")
 
     # ---- 6. Visualisasi (menggunakan density_utils.create_visualization) ----
     overlay = create_visualization(

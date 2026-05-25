@@ -214,7 +214,7 @@ def train():
                 'train_mae': avg_train_mae,
                 'loss': avg_train_loss,
             }, BEST_MODEL_PATH)
-            marker = " ★ SAVED"
+            marker = " * SAVED"
         else:
             marker = ""
 

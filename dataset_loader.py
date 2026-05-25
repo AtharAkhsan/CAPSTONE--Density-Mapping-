@@ -165,10 +165,10 @@ def stratified_split(samples, val_ratio=0.2, seed=42):
         val_samples.extend(bucket[:n_val])
         train_samples.extend(bucket[n_val:])
 
-        print(f"    Bucket {label:>8s}: {len(bucket):>3d} total → "
+        print(f"    Bucket {label:>8s}: {len(bucket):>3d} total -> "
               f"{len(bucket) - n_val:>3d} train, {n_val:>3d} val")
 
-    print(f"    {'TOTAL':>15s}: {len(samples):>3d} total → "
+    print(f"    {'TOTAL':>15s}: {len(samples):>3d} total -> "
           f"{len(train_samples):>3d} train, {len(val_samples):>3d} val")
 
     return train_samples, val_samples
