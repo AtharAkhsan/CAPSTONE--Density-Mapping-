@@ -1,4 +1,5 @@
 import os
+import argparse
 import numpy as np
 import cv2
 import torch
@@ -14,7 +15,8 @@ from density_utils import create_visualization
 # ============================================================
 # Konfigurasi
 # ============================================================
-CHECKPOINT_PATH = os.path.join('checkpoints', 'best_dme_model.pth')
+# Default fallback checkpoint (can be overridden by argparse)
+DEFAULT_CHECKPOINT = os.path.join('checkpoints', 'final_dme_97percent.pth')
 
 # Resolusi target - harus sama dengan yang digunakan saat training (dataset_loader.py)
 TARGET_SIZE = (672, 512)  # (width, height)
@@ -122,14 +124,6 @@ def predict(model, image_tensor, device):
 def resize_density_map_to_original(density_map, original_size, target_size=TARGET_SIZE):
     """
     Kembalikan density map ke ukuran asli gambar dengan koreksi area.
-
-    Parameters:
-        density_map (np.ndarray): Density map pada ukuran target.
-        original_size (tuple): (orig_w, orig_h) ukuran gambar asli.
-        target_size (tuple): (target_w, target_h) ukuran saat inference.
-
-    Returns:
-        np.ndarray: Density map ukuran asli dengan sum ~ jumlah objek.
     """
     orig_w, orig_h = original_size
     target_w, target_h = target_size
@@ -144,13 +138,11 @@ def resize_density_map_to_original(density_map, original_size, target_size=TARGE
     density_orig = cv2.resize(density_map, (orig_w, orig_h),
                               interpolation=cv2.INTER_LINEAR)
 
-    # Koreksi area: setelah resize, sum berubah karena area pixel berubah.
-    # Kita normalkan kembali agar sum tetap sama dengan sebelum resize.
+    # Koreksi area
     sum_after_resize = density_orig.sum()
     if sum_after_resize > 0:
         density_orig *= (sum_before / sum_after_resize)
 
-    # Debug assertion: pastikan count tidak berubah signifikan saat resize
     if DEBUG:
         assert abs(density_orig.sum() - sum_before) < 0.5, \
             (f"Count changed during resize: "
@@ -186,14 +178,9 @@ def visualize_result(original_image, overlay, predicted_count, image_name):
     plt.show()
 
 
-def run_prediction(image_path, checkpoint_path=CHECKPOINT_PATH, target_size=TARGET_SIZE):
+def run_prediction(image_path, checkpoint_path=DEFAULT_CHECKPOINT, target_size=TARGET_SIZE):
     """
     Pipeline lengkap prediksi yang sekarang scale-invariant.
-    1. Load model
-    2. Preprocess: resize gambar ke target size, simpan original
-    3. Inference pada ukuran target
-    4. Kembalikan density map ke ukuran asli dengan koreksi count
-    5. Visualisasi overlay pada gambar asli
     """
     image_name = os.path.basename(image_path)
 
@@ -208,7 +195,7 @@ def run_prediction(image_path, checkpoint_path=CHECKPOINT_PATH, target_size=TARG
     print(f"\n  [Model Loading]")
     if not os.path.exists(checkpoint_path):
         print(f"\n  [ERROR] Checkpoint tidak ditemukan: {checkpoint_path}")
-        print(f"  Jalankan training terlebih dahulu: py train.py")
+        print(f"  Pastikan path benar atau jalankan training terlebih dahulu.")
         return
     model = load_model(checkpoint_path, device)
 
@@ -254,29 +241,41 @@ def run_prediction(image_path, checkpoint_path=CHECKPOINT_PATH, target_size=TARG
 # Eksekusi Utama
 # ============================================================
 if __name__ == '__main__':
-    import sys
+    parser = argparse.ArgumentParser(description="DME Prediction Script")
+    parser.add_argument("--image", type=str, default=None, help="Path to test image")
+    parser.add_argument("--checkpoint", type=str, default=DEFAULT_CHECKPOINT, help="Path to model checkpoint")
+    
+    args = parser.parse_args()
 
-    if len(sys.argv) > 1:
-        TEST_IMAGE_PATH = sys.argv[1]
-        if not os.path.exists(TEST_IMAGE_PATH):
-            print(f"[ERROR] File gambar tidak ditemukan: {TEST_IMAGE_PATH}")
-            sys.exit(1)
-        print(f"Menggunakan gambar dari argumen: {TEST_IMAGE_PATH}")
-        run_prediction(TEST_IMAGE_PATH)
+    # Determine image path
+    if args.image:
+        if not os.path.exists(args.image):
+            print(f"[ERROR] File gambar tidak ditemukan: {args.image}")
+            exit(1)
+        test_image = args.image
+        print(f"Menggunakan gambar dari argumen: {test_image}")
     else:
-        TEST_IMAGE_DIR = os.path.join('dataset', 'images')
-
+        # Fallback to default image in dataset/images
+        test_image_dir = os.path.join('dataset', 'images')
         supported_ext = ('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff')
+        
+        # Check if dir exists before listing
+        if not os.path.exists(test_image_dir):
+            print(f"[ERROR] Direktori gambar tidak ditemukan: {test_image_dir}")
+            print(f"Gunakan argumen --image untuk menspesifikasi path gambar.")
+            exit(1)
+            
         image_files = sorted([
-            f for f in os.listdir(TEST_IMAGE_DIR)
+            f for f in os.listdir(test_image_dir)
             if f.lower().endswith(supported_ext)
         ])
 
         if not image_files:
-            print(f"Tidak ada gambar di folder '{TEST_IMAGE_DIR}'")
-        else:
-            TEST_IMAGE_PATH = os.path.join(TEST_IMAGE_DIR, image_files[0])
-            print(f"Tidak ada argumen path gambar yang diberikan.")
-            print(f"Menggunakan gambar test default: {TEST_IMAGE_PATH}")
-            print(f"Tips: Anda bisa menjalankan dengan: py predict.py path/ke/gambar.jpg\n")
-            run_prediction(TEST_IMAGE_PATH)
+            print(f"Tidak ada gambar di folder '{test_image_dir}'")
+            exit(1)
+        test_image = os.path.join(test_image_dir, image_files[0])
+        print(f"Tidak ada argumen path gambar yang diberikan.")
+        print(f"Menggunakan gambar test default: {test_image}")
+        print(f"Tips: Anda bisa menjalankan dengan: python predict.py --image path/ke/gambar.jpg --checkpoint path/ke/model.pth\n")
+    
+    run_prediction(test_image, checkpoint_path=args.checkpoint)

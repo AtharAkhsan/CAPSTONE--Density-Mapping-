@@ -1,5 +1,6 @@
 import os
 import time
+import argparse
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -14,11 +15,12 @@ from dataset_loader import (
 
 
 # ============================================================
-# Hyperparameters
+# Hyperparameters Default
 # ============================================================
 EPOCHS = 30
 BATCH_SIZE = 2          # Kecil karena komputasi heatmap cukup berat
-LEARNING_RATE = 5e-5    # Learning rate untuk fine-tuning
+LEARNING_RATE_SCRATCH = 5e-5    # Learning rate untuk training dari scratch
+LEARNING_RATE_FINETUNE = 1e-5   # Learning rate lebih kecil untuk fine-tuning
 CHECKPOINT_DIR = 'checkpoints'
 BEST_MODEL_PATH = os.path.join(CHECKPOINT_DIR, 'best_dme_model.pth')
 
@@ -41,14 +43,14 @@ def select_device():
     return device
 
 
-def train():
+def train(args):
     """
     Fungsi utama untuk training model DME.
-    Training dari scratch (ImageNet pretrained weights) dengan stratified
-    train/val split dan scale augmentation.
+    Bisa training dari scratch (ImageNet pretrained weights) atau fine-tuning
+    dari external checkpoint.
     """
     print("\n" + "=" * 65)
-    print("  TRAINING — Density Map Estimation (DME)")
+    print("  TRAINING / FINE-TUNING — Density Map Estimation (DME)")
     print("=" * 65)
 
     # ---- 1. Device Selection ----
@@ -64,14 +66,11 @@ def train():
     all_samples = load_all_samples()
     if len(all_samples) == 0:
         print("\n  [ERROR] Tidak ada data training!")
-        print("  Pastikan sudah menjalankan:")
-        print("    1. py point_labeler.py          (anotasi titik)")
-        print("    2. Pastikan file JSON anotasi ada di dataset/annotations/")
+        print("  Pastikan sudah menjalankan anotasi dan generate_ground_truth.py.")
         return
 
     train_samples, val_samples = stratified_split(all_samples, val_ratio=0.2)
 
-    # Buat dataset objects
     train_transform = get_train_transforms()
     val_transform = get_val_transforms()
 
@@ -83,7 +82,7 @@ def train():
     val_dataset = DMEDataset(
         samples=val_samples,
         transform=val_transform,
-        scale_range=(1.0, 1.0),  # Tidak ada scale augmentation saat validasi
+        scale_range=(1.0, 1.0),
     )
 
     train_loader = DataLoader(
@@ -107,28 +106,61 @@ def train():
     print(f"  Train batches  : {len(train_loader)}")
     print(f"  Val batches    : {len(val_loader)}")
 
-    # ---- 4. Model (from scratch with ImageNet pretrained backbone) ----
+    # ---- 4. Model & Checkpoint Loading ----
     print(f"\n  [Model]")
-    model = DensityMapRegressor(pretrained=True)
+    model = DensityMapRegressor(pretrained=not args.resume)
+    
+    # Tentukan learning rate berdasarkan mode (resume vs scratch)
+    current_lr = args.lr if args.lr is not None else (LEARNING_RATE_FINETUNE if args.resume else LEARNING_RATE_SCRATCH)
+    start_epoch = 1
+
+    if args.resume:
+        if not os.path.exists(args.resume):
+            print(f"  [ERROR] Checkpoint resume tidak ditemukan: {args.resume}")
+            return
+        
+        print(f"  Resuming from  : {args.resume}")
+        checkpoint = torch.load(args.resume, map_location='cpu', weights_only=True)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        
+        if 'epoch' in checkpoint:
+            print(f"  Loaded epoch   : {checkpoint['epoch']}")
+        if 'best_mae' in checkpoint or 'best_val_mae' in checkpoint:
+            best_mae_val = checkpoint.get('best_val_mae', checkpoint.get('best_mae', '?'))
+            print(f"  Loaded Best MAE: {best_mae_val}")
+    else:
+        print(f"  Training from  : scratch (ImageNet pretrained backbone)")
+
     model = model.to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  Architecture   : MobileNetV2 + Dilated Conv + Upsample")
     print(f"  Total params   : {total_params:,}")
-    print(f"  Trainable      : {trainable_params:,}")
-    print(f"  Training from  : scratch (ImageNet pretrained backbone)")
 
     # ---- 5. Loss Function & Optimizer ----
-    # MSELoss karena ini adalah regresi heatmap (bukan klasifikasi)
     criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    optimizer = optim.Adam(model.parameters(), lr=current_lr)
+
+    if args.resume and args.load_optimizer:
+        # User requested to restore optimizer state. Requires weights_only=False
+        checkpoint_full = torch.load(args.resume, map_location=device, weights_only=False) 
+        if 'optimizer_state_dict' in checkpoint_full:
+            optimizer.load_state_dict(checkpoint_full['optimizer_state_dict'])
+            print(f"  Optimizer state: Restored from checkpoint")
+            
+            # Update learning rate on restored optimizer if user specified a custom lr or to ensure finetune lr is used
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = current_lr
+        else:
+            print(f"  Optimizer state: Not found in checkpoint, starting fresh.")
 
     print(f"\n  [Training Config]")
     print(f"  Loss function  : MSELoss")
     print(f"  Optimizer      : Adam")
-    print(f"  Learning rate  : {LEARNING_RATE}")
+    print(f"  Learning rate  : {current_lr}")
     print(f"  Epochs         : {EPOCHS}")
+    print(f"  Freeze backbone: {'Yes (first 5 epochs)' if args.freeze_backbone else 'No'}")
     print(f"  Checkpoint dir : {os.path.abspath(CHECKPOINT_DIR)}")
 
     # ---- 6. Training Loop ----
@@ -139,8 +171,22 @@ def train():
           f"{'Val MAE':>10}  |  {'Best Val MAE':>12}  |  Time")
     print("-" * 80)
 
-    for epoch in range(1, EPOCHS + 1):
+    for epoch in range(start_epoch, EPOCHS + 1):
         epoch_start = time.time()
+
+        # ======== FREEZE / UNFREEZE LOGIC ========
+        if args.freeze_backbone:
+            if epoch <= 5:
+                # Freeze features
+                for param in model.features.parameters():
+                    param.requires_grad = False
+                if epoch == 1:
+                    print("  [INFO] Backbone is FROZEN for the first 5 epochs.")
+            elif epoch == 6:
+                # Unfreeze features
+                for param in model.features.parameters():
+                    param.requires_grad = True
+                print("  [INFO] Backbone UNFROZEN for the remaining epochs.")
 
         # ======== TRAINING PHASE ========
         model.train()
@@ -149,25 +195,17 @@ def train():
         num_train_samples = 0
 
         for batch_idx, batch in enumerate(train_loader):
-            # Ambil data dari batch
             images = batch['image'].to(device)          # (B, 3, H, W)
             heatmaps = batch['heatmap'].to(device)      # (B, H, W)
-
-            # Tambahkan dimensi channel pada heatmap: (B, H, W) -> (B, 1, H, W)
             heatmaps = heatmaps.unsqueeze(1)
 
-            # ---- Forward pass ----
             outputs = model(images)                     # (B, 1, H, W)
-
-            # ---- Hitung loss (MSE antara predicted & ground truth heatmap) ----
             loss = criterion(outputs, heatmaps * 1000.0)
 
-            # ---- Backward pass & optimizer step ----
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-            # ---- Hitung MAE (selisih jumlah objek) ----
             with torch.no_grad():
                 batch_size_actual = images.size(0)
                 for i in range(batch_size_actual):
@@ -195,11 +233,10 @@ def train():
 
                 for i in range(images.size(0)):
                     pred_count = outputs[i].sum().item() / 1000.0
-                    gt_count = heatmaps[i].sum().item()  # NOT scaled by 1000
+                    gt_count = heatmaps[i].sum().item()
                     val_mae += abs(pred_count - gt_count)
 
         avg_val_mae = val_mae / len(val_dataset)
-
         epoch_time = time.time() - epoch_start
 
         # ---- Model Checkpointing (based on val MAE) ----
@@ -232,4 +269,15 @@ def train():
 
 
 if __name__ == '__main__':
-    train()
+    parser = argparse.ArgumentParser(description="DME Training & Fine-tuning Script")
+    parser.add_argument("--resume", type=str, default=None, 
+                        help="Path to checkpoint to resume or fine-tune from")
+    parser.add_argument("--freeze-backbone", action="store_true", 
+                        help="Freeze the MobileNetV2 backbone for the first 5 epochs")
+    parser.add_argument("--load-optimizer", action="store_true", 
+                        help="Load optimizer state from checkpoint (if resuming)")
+    parser.add_argument("--lr", type=float, default=None, 
+                        help="Override learning rate (default: 5e-5 scratch, 1e-5 fine-tune)")
+    
+    args = parser.parse_args()
+    train(args)
