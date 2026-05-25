@@ -1,11 +1,19 @@
 import os
 import argparse
+import csv
+from datetime import datetime
 import numpy as np
 import cv2
 import torch
 import matplotlib.pyplot as plt
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
+
+try:
+    import pandas as pd
+    PANDAS_AVAILABLE = True
+except ImportError:
+    PANDAS_AVAILABLE = False
 
 # Import dari file proyek
 from model_dme import DensityMapRegressor
@@ -238,44 +246,293 @@ def run_prediction(image_path, checkpoint_path=DEFAULT_CHECKPOINT, target_size=T
 
 
 # ============================================================
+# Report Generation
+# ============================================================
+
+def generate_reports(results, checkpoint_path, sort_order='alpha'):
+    """
+    Generate a CSV and a Markdown summary report after batch prediction.
+
+    Parameters:
+        results       : list of (image_name, predicted_count, density_map_sum)
+        checkpoint_path : str — path of the checkpoint used
+        sort_order    : 'alpha' | 'highest' | 'lowest'
+
+    Returns:
+        (csv_path, md_path) — absolute paths to the generated report files.
+    """
+    REPORTS_DIR = 'reports'
+    os.makedirs(REPORTS_DIR, exist_ok=True)
+
+    timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    csv_path  = os.path.join(REPORTS_DIR, f'prediction_report_{timestamp}.csv')
+    md_path   = os.path.join(REPORTS_DIR, f'prediction_summary_{timestamp}.md')
+    ckpt_name = os.path.basename(checkpoint_path)
+
+    # ---- Apply sort order ----
+    if sort_order == 'highest':
+        sorted_results = sorted(results, key=lambda x: x[1], reverse=True)
+    elif sort_order == 'lowest':
+        sorted_results = sorted(results, key=lambda x: x[1])
+    else:  # 'alpha' (default)
+        sorted_results = sorted(results, key=lambda x: x[0])
+
+    counts = [r[1] for r in sorted_results]
+
+    # ---- Write CSV ----
+    if PANDAS_AVAILABLE:
+        df = pd.DataFrame(sorted_results,
+                          columns=['Image Name', 'Predicted Count', 'Density Map Sum'])
+        df['Checkpoint Used'] = ckpt_name
+        df.to_csv(csv_path, index=False, float_format='%.4f')
+    else:
+        with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(['Image Name', 'Predicted Count', 'Density Map Sum', 'Checkpoint Used'])
+            for name, count, dsum in sorted_results:
+                writer.writerow([name, f'{count:.4f}', f'{dsum:.4f}', ckpt_name])
+
+    # ---- Compute distribution buckets ----
+    buckets = {
+        '0–99':    sum(1 for c in counts if c < 100),
+        '100–149': sum(1 for c in counts if 100 <= c < 150),
+        '150–199': sum(1 for c in counts if 150 <= c < 200),
+        '200–249': sum(1 for c in counts if 200 <= c < 250),
+        '250–349': sum(1 for c in counts if 250 <= c < 350),
+        '350+':    sum(1 for c in counts if c >= 350),
+    }
+
+    top10_high = sorted(results, key=lambda x: x[1], reverse=True)[:10]
+    top10_low  = sorted(results, key=lambda x: x[1])[:10]
+
+    # ---- Write Markdown ----
+    with open(md_path, 'w', encoding='utf-8') as f:
+        f.write('# DME Batch Prediction Summary Report\n\n')
+        f.write(f'**Generated:** {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}\n\n')
+        f.write('---\n\n')
+
+        f.write('## Metadata\n\n')
+        f.write('| Property | Value |\n')
+        f.write('|----------|-------|\n')
+        f.write(f'| Checkpoint | `{ckpt_name}` |\n')
+        f.write(f'| Checkpoint Path | `{checkpoint_path}` |\n')
+        f.write(f'| Total Images Processed | {len(results)} |\n')
+        f.write(f'| Sort Order | {sort_order} |\n')
+        f.write(f'| Timestamp | {timestamp} |\n\n')
+
+        f.write('## ⚠️ Important Warnings\n\n')
+        f.write('> **SMOKE TEST ONLY — NOT REAL-WORLD EVALUATION**\n>\n')
+        f.write('> The `dataset/images/` folder currently contains **training images only**.\n')
+        f.write('> Predictions on training images are used ONLY to verify pipeline correctness.\n')
+        f.write('> Do **NOT** use these results to claim real-world accuracy.\n')
+        f.write('> Upload **unseen test images** for genuine evaluation.\n\n')
+
+        f.write('## Summary Statistics\n\n')
+        f.write('| Metric | Value |\n')
+        f.write('|--------|-------|\n')
+        f.write(f'| Average Predicted Count | {np.mean(counts):.1f} |\n')
+        f.write(f'| Minimum Predicted Count | {min(counts):.1f} |\n')
+        f.write(f'| Maximum Predicted Count | {max(counts):.1f} |\n')
+        f.write(f'| Std Deviation | {np.std(counts):.2f} |\n\n')
+
+        f.write('## Prediction Distribution\n\n')
+        f.write('| Count Range | Number of Images |\n')
+        f.write('|-------------|------------------|\n')
+        for bucket, cnt in buckets.items():
+            f.write(f'| {bucket} | {cnt} |\n')
+        f.write('\n')
+
+        f.write('## Top 10 Highest Predictions\n\n')
+        f.write('| # | Image Name | Predicted Count |\n')
+        f.write('|---|------------|-----------------|\n')
+        for rank, (name, count, _) in enumerate(top10_high, 1):
+            f.write(f'| {rank} | {name} | {count:.1f} |\n')
+        f.write('\n')
+
+        f.write('## Top 10 Lowest Predictions\n\n')
+        f.write('| # | Image Name | Predicted Count |\n')
+        f.write('|---|------------|-----------------|\n')
+        for rank, (name, count, _) in enumerate(top10_low, 1):
+            f.write(f'| {rank} | {name} | {count:.1f} |\n')
+        f.write('\n')
+
+        f.write('## Full Prediction Table\n\n')
+        f.write('| Image Name | Predicted Count | Density Map Sum |\n')
+        f.write('|------------|-----------------|------------------|\n')
+        for name, count, dsum in sorted_results:
+            f.write(f'| {name} | {count:.1f} | {dsum:.4f} |\n')
+        f.write('\n')
+        f.write('---\n')
+        f.write('*Generated by predict.py — DME Pipeline*\n')
+
+    return os.path.abspath(csv_path), os.path.abspath(md_path)
+
+
+def print_summary_to_terminal(results, checkpoint_path, csv_path, md_path, sort_order='alpha'):
+    """
+    Print a clean, human-readable summary report to the terminal after batch inference.
+    """
+    ckpt_name = os.path.basename(checkpoint_path)
+    counts    = [r[1] for r in results]
+
+    if sort_order == 'highest':
+        sorted_results = sorted(results, key=lambda x: x[1], reverse=True)
+    elif sort_order == 'lowest':
+        sorted_results = sorted(results, key=lambda x: x[1])
+    else:
+        sorted_results = sorted(results, key=lambda x: x[0])
+
+    top10_high = sorted(results, key=lambda x: x[1], reverse=True)[:10]
+    top10_low  = sorted(results, key=lambda x: x[1])[:10]
+
+    sep  = '=' * 65
+    sep2 = '-' * 65
+
+    print('\n' + sep)
+    print('  BATCH PREDICTION - FINAL SUMMARY REPORT')
+    print(sep)
+    print(f'  Checkpoint        : {ckpt_name}')
+    print(f'  Total images      : {len(results)}')
+    print(f'  Sort order        : {sort_order}')
+    print(sep2)
+
+    print('\n  [WARNING] SMOKE TEST - NOT REAL-WORLD EVALUATION')
+    print('  dataset/images/ contains TRAINING images.')
+    print('  Results verify pipeline correctness ONLY.')
+    print('  Do NOT claim real-world accuracy from this run.')
+    print(sep2)
+
+    print('\n  SUMMARY STATISTICS')
+    print(f'  Average predicted count : {np.mean(counts):.1f}')
+    print(f'  Minimum predicted count : {min(counts):.1f}')
+    print(f'  Maximum predicted count : {max(counts):.1f}')
+    print(f'  Std Deviation           : {np.std(counts):.2f}')
+    print(sep2)
+
+    print('\n  PREDICTION DISTRIBUTION')
+    dist = [
+        ('0-99',    sum(1 for c in counts if c < 100)),
+        ('100-149', sum(1 for c in counts if 100 <= c < 150)),
+        ('150-199', sum(1 for c in counts if 150 <= c < 200)),
+        ('200-249', sum(1 for c in counts if 200 <= c < 250)),
+        ('250-349', sum(1 for c in counts if 250 <= c < 350)),
+        ('350+',    sum(1 for c in counts if c >= 350)),
+    ]
+    for bucket, cnt in dist:
+        bar = '#' * cnt
+        print(f'  {bucket:<8} : {cnt:>3}  {bar}')
+    print(sep2)
+
+    print('\n  TOP 10 HIGHEST PREDICTIONS')
+    print(f'  {"#":<4} {"Image Name":<34} {"Predicted Count":>15}')
+    print('  ' + '-' * 56)
+    for rank, (name, count, _) in enumerate(top10_high, 1):
+        print(f'  {rank:<4} {name:<34} {count:>15.1f}')
+
+    print('\n  TOP 10 LOWEST PREDICTIONS')
+    print(f'  {"#":<4} {"Image Name":<34} {"Predicted Count":>15}')
+    print('  ' + '-' * 56)
+    for rank, (name, count, _) in enumerate(top10_low, 1):
+        print(f'  {rank:<4} {name:<34} {count:>15.1f}')
+    print(sep2)
+
+    print('\n  FULL PREDICTION TABLE')
+    print(f'  {"Image Name":<34} | {"Predicted Count":>15} | {"Density Sum":>12}')
+    print('  ' + '-' * 68)
+    for name, count, dsum in sorted_results:
+        print(f'  {name:<34} | {count:>15.1f} | {dsum:>12.4f}')
+
+    print('\n' + sep)
+    print('  [OK] REPORT FILES GENERATED SUCCESSFULLY')
+    print(f'  CSV      : {csv_path}')
+    print(f'  Markdown : {md_path}')
+    print(sep + '\n')
+
+
+# ============================================================
 # Eksekusi Utama
 # ============================================================
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="DME Prediction Script")
     parser.add_argument("--image", type=str, default=None, help="Path to test image")
+    parser.add_argument("--dir", type=str, default=None, help="Path to directory containing test images")
     parser.add_argument("--checkpoint", type=str, default=DEFAULT_CHECKPOINT, help="Path to model checkpoint")
+    parser.add_argument("--sort", type=str, default='alpha',
+                        choices=['alpha', 'highest', 'lowest'],
+                        help="Sort order for batch report: alpha | highest | lowest (default: alpha)")
     
     args = parser.parse_args()
 
-    # Determine image path
-    if args.image:
-        if not os.path.exists(args.image):
-            print(f"[ERROR] File gambar tidak ditemukan: {args.image}")
+    if args.dir:
+        if not os.path.exists(args.dir):
+            print(f"[ERROR] Direktori gambar tidak ditemukan: {args.dir}")
             exit(1)
-        test_image = args.image
-        print(f"Menggunakan gambar dari argumen: {test_image}")
-    else:
-        # Fallback to default image in dataset/images
-        test_image_dir = os.path.join('dataset', 'images')
-        supported_ext = ('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff')
         
-        # Check if dir exists before listing
-        if not os.path.exists(test_image_dir):
-            print(f"[ERROR] Direktori gambar tidak ditemukan: {test_image_dir}")
-            print(f"Gunakan argumen --image untuk menspesifikasi path gambar.")
-            exit(1)
-            
+        supported_ext = ('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff')
         image_files = sorted([
-            f for f in os.listdir(test_image_dir)
+            f for f in os.listdir(args.dir)
             if f.lower().endswith(supported_ext)
         ])
-
+        
         if not image_files:
-            print(f"Tidak ada gambar di folder '{test_image_dir}'")
+            print(f"Tidak ada gambar di folder '{args.dir}'")
             exit(1)
-        test_image = os.path.join(test_image_dir, image_files[0])
-        print(f"Tidak ada argumen path gambar yang diberikan.")
-        print(f"Menggunakan gambar test default: {test_image}")
-        print(f"Tips: Anda bisa menjalankan dengan: python predict.py --image path/ke/gambar.jpg --checkpoint path/ke/model.pth\n")
-    
-    run_prediction(test_image, checkpoint_path=args.checkpoint)
+            
+        print(f"Ditemukan {len(image_files)} gambar di {args.dir}")
+        print("Mulai batch prediction...")
+        
+        results = []
+        for i, file_name in enumerate(image_files):
+            print(f"\n[{i+1}/{len(image_files)}] Memproses {file_name}...")
+            img_path = os.path.join(args.dir, file_name)
+            
+            # Temporarily disable plt.show by mocking it to prevent hanging during batch
+            original_show = plt.show
+            plt.show = lambda: plt.close('all')
+            
+            try:
+                final_count = run_prediction(img_path, checkpoint_path=args.checkpoint)
+                # store (name, predicted_count, density_map_sum) — counts are the same
+                results.append((file_name, final_count, final_count))
+            finally:
+                plt.show = original_show
+
+        # results stored as (name, count, density_map_sum)
+        # generate reports and print terminal summary
+        if results:
+            csv_path, md_path = generate_reports(results, args.checkpoint, sort_order=args.sort)
+            print_summary_to_terminal(results, args.checkpoint, csv_path, md_path, sort_order=args.sort)
+        
+    else:
+        # Single image mode
+        # Determine image path
+        if args.image:
+            if not os.path.exists(args.image):
+                print(f"[ERROR] File gambar tidak ditemukan: {args.image}")
+                exit(1)
+            test_image = args.image
+            print(f"Menggunakan gambar dari argumen: {test_image}")
+        else:
+            # Fallback to default image in dataset/images
+            test_image_dir = os.path.join('dataset', 'images')
+            supported_ext = ('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff')
+            
+            if not os.path.exists(test_image_dir):
+                print(f"[ERROR] Direktori gambar tidak ditemukan: {test_image_dir}")
+                print(f"Gunakan argumen --image untuk menspesifikasi path gambar.")
+                exit(1)
+                
+            image_files = sorted([
+                f for f in os.listdir(test_image_dir)
+                if f.lower().endswith(supported_ext)
+            ])
+
+            if not image_files:
+                print(f"Tidak ada gambar di folder '{test_image_dir}'")
+                exit(1)
+            test_image = os.path.join(test_image_dir, image_files[0])
+            print(f"Tidak ada argumen path gambar yang diberikan.")
+            print(f"Menggunakan gambar test default: {test_image}")
+            print(f"Tips: Anda bisa menjalankan dengan: python predict.py --image path/ke/gambar.jpg --checkpoint path/ke/model.pth\n")
+        
+        run_prediction(test_image, checkpoint_path=args.checkpoint)
