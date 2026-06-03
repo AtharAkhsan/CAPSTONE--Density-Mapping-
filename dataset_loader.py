@@ -1,14 +1,15 @@
 import os
 import json
 import glob
-import math
 import numpy as np
 import cv2
 import torch
 from torch.utils.data import Dataset, DataLoader
-from scipy.ndimage import gaussian_filter
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
+
+# Import dari shared module
+from density_utils import generate_density_map
 
 
 # ==============================
@@ -80,135 +81,137 @@ def get_val_transforms():
     ])
 
 
-def generate_density_map_online(image_shape, points, base_sigma=8,
-                                reference_resolution=(REFERENCE_W, REFERENCE_H)):
+def load_all_samples(images_dir=IMAGES_DIR, annotations_dir=ANNOTATIONS_DIR):
     """
-    Generate density map on-the-fly dari koordinat titik dengan sigma adaptif.
-
-    Sigma dihitung berdasarkan rasio area gambar terhadap resolusi referensi:
-        sigma = base_sigma * sqrt((w * h) / (ref_w * ref_h))
-
-    Ini memastikan ukuran Gaussian blob skala proporsional dengan ukuran objek
-    pada resolusi tertentu, sehingga density map tetap konsisten meskipun
-    resolusi gambar berubah-ubah.
-
-    Parameters:
-        image_shape (tuple): (height, width) dari gambar.
-        points (list): List koordinat [[x1, y1], [x2, y2], ...].
-        base_sigma (float): Sigma dasar pada resolusi referensi.
-        reference_resolution (tuple): (ref_w, ref_h) resolusi referensi.
+    Scan semua pasangan (gambar, anotasi JSON) yang tersedia.
 
     Returns:
-        numpy.ndarray: Density map (float32) dengan sum ≈ jumlah titik.
+        list[dict]: List of {'image_path', 'points', 'name', 'count'}.
     """
-    h, w = image_shape
-    ref_w, ref_h = reference_resolution
+    json_files = sorted(glob.glob(os.path.join(annotations_dir, '*.json')))
 
-    # Adaptive sigma: skala berdasarkan rasio area
-    area_ratio = (w * h) / (ref_w * ref_h)
-    sigma = base_sigma * math.sqrt(area_ratio)
+    samples = []
+    for json_path in json_files:
+        with open(json_path, 'r') as f:
+            data = json.load(f)
 
-    density = np.zeros((h, w), dtype=np.float32)
+        image_filename = data.get('image', '')
+        points = data.get('points', [])
 
-    for point in points:
-        x, y = int(round(point[0])), int(round(point[1]))
+        # Cari gambar: pertama coba nama dari JSON, lalu fallback ke basename
+        image_path = os.path.join(images_dir, image_filename)
+        if not os.path.exists(image_path):
+            basename = os.path.splitext(os.path.basename(json_path))[0]
+            image_path = None
+            for ext in ['.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff']:
+                candidate = os.path.join(images_dir, basename + ext)
+                if os.path.exists(candidate):
+                    image_path = candidate
+                    break
 
-        # Pastikan koordinat dalam batas gambar
-        if 0 <= y < h and 0 <= x < w:
-            density[y, x] = 1.0  # Numpy: (baris/y, kolom/x)
+        if image_path is not None and os.path.exists(image_path):
+            name = os.path.splitext(os.path.basename(json_path))[0]
+            samples.append({
+                'image_path': image_path,
+                'points': points,
+                'name': name,
+                'count': len(points),
+            })
 
-    # Aplikasikan Gaussian filter
-    if len(points) > 0:
-        density = gaussian_filter(density, sigma=sigma)
+    return samples
 
-    return density
+
+def stratified_split(samples, val_ratio=0.2, seed=42):
+    """
+    Split samples into train/val sets, stratified by count bucket.
+
+    Buckets: 70–99, 100–149, 150–199, 200–249, 250–349.
+    Ensures every count range is represented in validation.
+
+    Parameters:
+        samples (list[dict]): Output dari load_all_samples().
+        val_ratio (float): Proporsi data validasi (default 0.2).
+        seed (int): Random seed untuk reprodusibilitas.
+
+    Returns:
+        tuple: (train_samples, val_samples)
+    """
+    rng = np.random.RandomState(seed)
+
+    # Definisikan bucket berdasarkan jumlah objek
+    bucket_edges = [0, 100, 150, 200, 250, float('inf')]
+    bucket_labels = ['70-99', '100-149', '150-199', '200-249', '250-349']
+
+    # Kelompokkan samples ke bucket
+    buckets = {label: [] for label in bucket_labels}
+    for sample in samples:
+        count = sample['count']
+        for i in range(len(bucket_edges) - 1):
+            if bucket_edges[i] <= count < bucket_edges[i + 1]:
+                buckets[bucket_labels[i]].append(sample)
+                break
+
+    train_samples = []
+    val_samples = []
+
+    print(f"\n  [Stratified Split] val_ratio={val_ratio}, seed={seed}")
+    for label in bucket_labels:
+        bucket = buckets[label]
+        if len(bucket) == 0:
+            continue
+
+        rng.shuffle(bucket)
+        n_val = max(1, int(len(bucket) * val_ratio))  # Minimal 1 per bucket
+        val_samples.extend(bucket[:n_val])
+        train_samples.extend(bucket[n_val:])
+
+        print(f"    Bucket {label:>8s}: {len(bucket):>3d} total -> "
+              f"{len(bucket) - n_val:>3d} train, {n_val:>3d} val")
+
+    print(f"    {'TOTAL':>15s}: {len(samples):>3d} total -> "
+          f"{len(train_samples):>3d} train, {len(val_samples):>3d} val")
+
+    return train_samples, val_samples
 
 
 class DMEDataset(Dataset):
     """
     PyTorch Custom Dataset untuk Density Map Estimation dengan Scale Augmentation.
 
-    Membaca pasangan gambar RGB dan anotasi titik dari file JSON, lalu:
-    1. Menerapkan random scale augmentation (faktor 0.5–1.5)
-    2. Menghasilkan density map on-the-fly dengan sigma adaptif
+    Membaca pasangan gambar RGB dan anotasi titik, lalu:
+    1. Menerapkan random scale augmentation (faktor 0.75–1.25)
+    2. Menghasilkan density map on-the-fly dengan KDTree adaptive sigma
     3. Me-resize ke ukuran training tetap (672×512) untuk batching konsisten
     4. Menerapkan augmentasi Albumentations (flip, warna, normalize)
 
-    === Mengapa Option B (resize ke ukuran tetap)? ===
+    === Mengapa resize ke ukuran tetap? ===
     Model menggunakan nn.Upsample(scale_factor=32) yang menghasilkan output
     berukuran proporsional terhadap input. Dengan ukuran input tetap, kita:
     - Menghindari kebutuhan custom collate_fn untuk padding batch
     - Menjamin dimensi output model konsisten untuk loss calculation
     - Menyederhanakan training loop tanpa mengorbankan scale invariance
-    
+
     Scale invariance tetap tercapai karena density map di-generate pada
-    resolusi yang sudah di-scale secara acak (0.5–1.5×), lalu di-resize.
-    Ini mengajarkan model untuk mengenali objek di berbagai skala.
-    Koreksi area (original_area / new_area) memastikan sum density map
-    tetap sama dengan jumlah objek sebenarnya.
+    resolusi yang sudah di-scale secara acak, lalu di-resize.
 
     Parameters:
-        images_dir (str): Path ke folder gambar.
-        annotations_dir (str): Path ke folder anotasi JSON.
+        samples (list[dict]): List of {'image_path', 'points', 'name', 'count'}.
         transform (albumentations.Compose): Pipeline augmentasi/transformasi.
         scale_range (tuple): Range faktor skala (min, max) untuk augmentasi.
         target_size (tuple): (width, height) ukuran training tetap.
-        base_sigma (float): Sigma dasar untuk Gaussian filter.
-        reference_resolution (tuple): (ref_w, ref_h) resolusi referensi.
     """
 
-    def __init__(self, images_dir=IMAGES_DIR, annotations_dir=ANNOTATIONS_DIR,
-                 transform=None, scale_range=(1.0, 1.0), # 0.5, 1.5
-                 target_size=(REFERENCE_W, REFERENCE_H),
-                 base_sigma=8,
-                 reference_resolution=(REFERENCE_W, REFERENCE_H)):
+    def __init__(self, samples, transform=None,
+                 scale_range=(0.75, 1.25),
+                 target_size=(REFERENCE_W, REFERENCE_H)):
         super().__init__()
-        self.images_dir = images_dir
-        self.annotations_dir = annotations_dir
+        self.samples = samples
         self.transform = transform
         self.scale_range = scale_range
         self.target_size = target_size  # (width, height)
-        self.base_sigma = base_sigma
-        self.reference_resolution = reference_resolution
 
-        # Kumpulkan semua file JSON (anotasi) yang tersedia
-        json_files = sorted(glob.glob(os.path.join(annotations_dir, '*.json')))
-
-        # Cocokkan dengan gambar yang ada di images_dir
-        self.samples = []
-        for json_path in json_files:
-            with open(json_path, 'r') as f:
-                data = json.load(f)
-
-            image_filename = data.get('image', '')
-            points = data.get('points', [])
-
-            # Cari gambar: pertama coba nama dari JSON, lalu fallback ke basename
-            image_path = os.path.join(images_dir, image_filename)
-            if not os.path.exists(image_path):
-                basename = os.path.splitext(os.path.basename(json_path))[0]
-                image_path = None
-                for ext in ['.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff']:
-                    candidate = os.path.join(images_dir, basename + ext)
-                    if os.path.exists(candidate):
-                        image_path = candidate
-                        break
-
-            if image_path is not None and os.path.exists(image_path):
-                name = os.path.splitext(os.path.basename(json_path))[0]
-                self.samples.append({
-                    'image_path': image_path,
-                    'points': points,
-                    'name': name,
-                })
-
-        print(f"[DMEDataset] Ditemukan {len(self.samples)} pasangan "
-              f"(image + annotation JSON)")
-
-        if len(self.samples) == 0:
-            print(f"  [WARNING] Tidak ada pasangan data yang ditemukan!")
-            print(f"  Images dir      : {os.path.abspath(images_dir)}")
-            print(f"  Annotations dir : {os.path.abspath(annotations_dir)}")
+        print(f"[DMEDataset] Loaded {len(self.samples)} samples, "
+              f"scale_range={self.scale_range}")
 
     def __len__(self):
         return len(self.samples)
@@ -218,12 +221,13 @@ class DMEDataset(Dataset):
         Mengambil satu pasangan data dengan scale augmentation.
 
         Pipeline per-sample:
-        1. Load gambar RGB dan koordinat titik dari JSON
+        1. Load gambar RGB dan koordinat titik
         2. Random scale: resize gambar & scale koordinat titik
         3. Generate density map on-the-fly pada resolusi yang di-scale
-        4. Resize gambar & density map ke target_size (672×512)
+        4. Koreksi density values: bagi dengan scale**2 agar sum tetap benar
+        5. Resize gambar & density map ke target_size (672×512)
            dengan koreksi area untuk mempertahankan sum density map
-        5. Terapkan augmentasi Albumentations (flip, warna, normalize)
+        6. Terapkan augmentasi Albumentations (flip, warna, normalize)
 
         Returns:
             dict: {
@@ -265,18 +269,19 @@ class DMEDataset(Dataset):
 
             scaled_points.append([sx, sy])
 
-        # ---- 4. Generate density map on-the-fly ----
-        # Density map di-generate pada resolusi yang sudah di-scale,
-        # sehingga sigma Gaussian juga menyesuaikan resolusi
-        density_map = generate_density_map_online(
+        # ---- 4. Generate density map on-the-fly (KDTree adaptive sigma) ----
+        density_map = generate_density_map(
             image_shape=(new_h, new_w),
             points=scaled_points,
-            base_sigma=self.base_sigma,
-            reference_resolution=self.reference_resolution,
         )
 
-        # ---- 5. Resize ke target_size untuk batching konsisten ----
-        # (Option B: resize ke ukuran tetap dengan koreksi area)
+        # ---- 5. Koreksi density values setelah scale ----
+        # Saat gambar di-scale up (>1), setiap pixel mencakup area lebih besar,
+        # sehingga density per pixel harus berkurang agar total count tetap sama.
+        # Tanpa koreksi ini, scaling up akan menginflasi total count sum.
+        density_map = density_map / (scale_factor ** 2)
+
+        # ---- 6. Resize ke target_size untuk batching konsisten ----
         target_w, target_h = self.target_size
 
         if (new_w != target_w) or (new_h != target_h):
@@ -293,12 +298,12 @@ class DMEDataset(Dataset):
 
             # Koreksi area: pastikan sum density map tetap = jumlah objek
             # Setelah resize, sum berubah karena area pixel berubah.
-            # Kita kalikan dengan rasio area untuk mengembalikan sum asli.
+            # Kita kalikan dengan rasio untuk mengembalikan sum asli.
             density_sum_after = density_map.sum()
             if density_sum_after > 0:
                 density_map *= (density_sum_before / density_sum_after)
 
-        # ---- 6. Terapkan augmentasi Albumentations ----
+        # ---- 7. Terapkan augmentasi Albumentations ----
         # Density map diperlakukan sebagai 'mask' agar spatial transforms
         # (HorizontalFlip, VerticalFlip) diterapkan secara sinkron
         if self.transform is not None:
@@ -353,19 +358,23 @@ if __name__ == '__main__':
     print("  DATASET LOADER - Sanity Check (Scale-Invariant)")
     print("=" * 60)
 
-    # Buat dataset dengan augmentasi training
-    train_transform = get_train_transforms()
-    dataset = DMEDataset(
-        images_dir=IMAGES_DIR,
-        annotations_dir=ANNOTATIONS_DIR,
-        transform=train_transform,
-    )
-
-    if len(dataset) == 0:
+    # Load semua samples dan split
+    all_samples = load_all_samples()
+    if len(all_samples) == 0:
         print("\n  Tidak ada data untuk di-load. Pastikan sudah menjalankan:")
         print("  1. py point_labeler.py    (anotasi titik)")
         print("  2. Pastikan file JSON anotasi ada di dataset/annotations/")
         exit()
+
+    train_samples, val_samples = stratified_split(all_samples)
+
+    # Buat dataset dengan augmentasi training
+    train_transform = get_train_transforms()
+    dataset = DMEDataset(
+        samples=train_samples,
+        transform=train_transform,
+        scale_range=(0.75, 1.25),
+    )
 
     # Load 1 sample
     sample = dataset[0]
