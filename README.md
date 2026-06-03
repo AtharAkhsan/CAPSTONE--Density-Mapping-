@@ -108,8 +108,8 @@ CAPSTONE (Density Mapping)/
 ### Instalasi Dependencies
 
 ```bash
-# Install semua dependencies sekaligus
-pip install numpy opencv-python scipy matplotlib torch torchvision albumentations
+# Install semua dependencies sekaligus menggunakan requirements.txt
+pip install -r requirements.txt
 ```
 
 | Library | Versi Min. | Kegunaan |
@@ -396,7 +396,7 @@ Gambar diproses langsung pada **resolusi aslinya** (tidak di-_resize_ secara kak
 cd "CAPSTONE (Density Mapping)"
 
 # 2. Install dependencies
-pip install numpy opencv-python scipy matplotlib torch torchvision
+pip install -r requirements.txt
 
 # 3. Letakkan gambar ke dataset/images/
 
