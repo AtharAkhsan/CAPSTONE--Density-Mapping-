@@ -1,6 +1,7 @@
 import os
 import time
 import argparse
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -221,7 +222,8 @@ def train(args):
 
         # ======== VALIDATION PHASE ========
         model.eval()
-        val_mae = 0.0
+        val_preds = []
+        val_gts = []
 
         with torch.no_grad():
             for batch in val_loader:
@@ -234,9 +236,35 @@ def train(args):
                 for i in range(images.size(0)):
                     pred_count = outputs[i].sum().item() / 1000.0
                     gt_count = heatmaps[i].sum().item()
-                    val_mae += abs(pred_count - gt_count)
+                    val_preds.append(pred_count)
+                    val_gts.append(gt_count)
 
-        avg_val_mae = val_mae / len(val_dataset)
+        val_preds_arr = np.array(val_preds, dtype=np.float64)
+        val_gts_arr = np.array(val_gts, dtype=np.float64)
+
+        avg_val_mae = np.mean(np.abs(val_preds_arr - val_gts_arr))
+        val_rmse = np.sqrt(np.mean((val_preds_arr - val_gts_arr) ** 2))
+        
+        # MAPE & Mean Counting Accuracy with safe masking for zero targets
+        mask = val_gts_arr > 0
+        if np.sum(mask) > 0:
+            val_mape = np.mean(np.abs(val_gts_arr[mask] - val_preds_arr[mask]) / val_gts_arr[mask]) * 100
+            
+            # Mean Counting Accuracy: clipped to [0, 100]%
+            acc_vals = 1.0 - np.abs(val_preds_arr[mask] - val_gts_arr[mask]) / val_gts_arr[mask]
+            acc_vals = np.clip(acc_vals, 0.0, 1.0)
+            val_accuracy = np.mean(acc_vals) * 100
+        else:
+            val_mape = 0.0
+            # If all gt are 0, accuracy is 100% if pred is 0, else 0%
+            acc_vals = np.where(val_preds_arr == 0.0, 100.0, 0.0)
+            val_accuracy = np.mean(acc_vals)
+
+        # R2 score computed manually: 1 - (SS_res / SS_tot)
+        ss_res = np.sum((val_gts_arr - val_preds_arr) ** 2)
+        ss_tot = np.sum((val_gts_arr - np.mean(val_gts_arr)) ** 2)
+        val_r2 = 1.0 - (ss_res / ss_tot) if ss_tot > 0.0 else 0.0
+
         epoch_time = time.time() - epoch_start
 
         # ---- Model Checkpointing (based on val MAE) ----
@@ -248,10 +276,53 @@ def train(args):
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'best_val_mae': best_val_mae,
+                'best_val_rmse': val_rmse,
+                'best_val_mape': val_mape,
+                'best_val_r2': val_r2,
+                'best_val_accuracy': val_accuracy,
                 'train_mae': avg_train_mae,
                 'loss': avg_train_loss,
             }, BEST_MODEL_PATH)
-            marker = " * SAVED"
+            
+            # Export CSV of actual vs predicted counts
+            try:
+                reports_dir = 'reports'
+                os.makedirs(reports_dir, exist_ok=True)
+                import csv
+                csv_path = os.path.join(reports_dir, 'val_best_actual_vs_predicted.csv')
+                with open(csv_path, 'w', newline='', encoding='utf-8') as csv_file:
+                    writer = csv.writer(csv_file)
+                    writer.writerow(['Index', 'Ground Truth Count', 'Predicted Count', 'Absolute Error'])
+                    for idx, (gt_c, pred_c) in enumerate(zip(val_gts, val_preds)):
+                        writer.writerow([idx, f'{gt_c:.4f}', f'{pred_c:.4f}', f'{abs(pred_c - gt_c):.4f}'])
+            except Exception as e:
+                print(f"  [WARNING] Gagal mengekspor CSV: {e}")
+                
+            # Generate scatter plot
+            try:
+                import matplotlib
+                matplotlib.use('Agg')
+                import matplotlib.pyplot as plt
+                plot_path = os.path.join(reports_dir, 'val_best_scatter_plot.png')
+                plt.figure(figsize=(8, 6))
+                plt.scatter(val_gts, val_preds, alpha=0.7, color='blue', edgecolors='k', label='Samples')
+                
+                # Draw ideal y=x line
+                max_val = max(max(val_gts), max(val_preds)) if len(val_gts) > 0 else 10.0
+                plt.plot([0, max_val], [0, max_val], 'r--', label='Ideal (y = x)')
+                
+                plt.title(f'Actual vs Predicted Count (Validation Epoch {epoch})')
+                plt.xlabel('Ground Truth Count')
+                plt.ylabel('Predicted Count')
+                plt.grid(True, linestyle='--', alpha=0.5)
+                plt.legend()
+                plt.tight_layout()
+                plt.savefig(plot_path, dpi=150)
+                plt.close()
+            except Exception as e:
+                print(f"  [WARNING] Gagal membuat scatter plot: {e}")
+
+            marker = " * SAVED (CSV & Plot updated)"
         else:
             marker = ""
 
@@ -259,6 +330,7 @@ def train(args):
         print(f"  {epoch:>5}  |  {avg_train_loss:>12.8f}  |  {avg_train_mae:>10.4f}  |  "
               f"{avg_val_mae:>10.4f}  |  {best_val_mae:>12.4f}  |  "
               f"{epoch_time:.1f}s{marker}")
+        print(f"         └─ Val Metrics: RMSE: {val_rmse:.4f} | MAPE: {val_mape:.2f}% | R²: {val_r2:.4f} | Accuracy: {val_accuracy:.2f}%")
 
     # ---- Training Selesai ----
     print("-" * 80)
