@@ -1,4 +1,7 @@
-torch
 numpy
 opencv-python
-pyserial
+torch
+torchvision
+matplotlib
+albumentations
+scipy
